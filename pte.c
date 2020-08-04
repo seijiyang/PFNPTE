@@ -135,7 +135,7 @@ DemandZero (
 }
 
 VOID
-Accessor (
+PageFault (
     PVOID LeafPageAddress
 )
 {
@@ -287,7 +287,7 @@ main (
         printf("%x\n", ModdedR);
         PVOID LeafAddress;
         LeafAddress = (PVOID)((ULONG_PTR) BaseLeafPageAddress + ModdedR);
-        Accessor (LeafAddress);
+        PageFault (LeafAddress);
     }
 
     RemoveFromActive (BaseLeafPageAddress);
@@ -295,7 +295,7 @@ main (
     return;
 }
 
-// have another for loop to randomly take from active to standby
+// have another for loop to take from active to standby
 // need to acces from the ones that are already accessed by the previous for loop
 // how to take out and put back from active
 // to take out: 
