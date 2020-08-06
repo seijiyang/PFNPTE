@@ -18,18 +18,18 @@
 #define PAGE_SIZE 4096
 
 typedef enum _PFN_PAGE_LOCATION {
-    // do not change order
     Free,
     Zero,
     Modified,
     Standby,
-    Bad,
-    Active
+    Active,
+    Bad
 } PFN_PAGE_LOCATION, *PPFN_PAGE_LOCATION;
 
 // create struct for PFN entries
 typedef struct _PFN_METADATA {
-    LIST_ENTRY Link;
+    PVOID Flink;
+    PVOID Blink;
     PFN_PAGE_LOCATION PageLocation;
 } PFN_METADATA, *PPFN_METADATA;
 
@@ -51,26 +51,19 @@ typedef struct _VAD_NODE {
     PVOID Child;
 } VAD_NODE, *PVAD_NODE;
 
-typedef struct _PAGE_LIST {
-    LIST_ENTRY ListHead;
-    ULONG Count;
-} PAGE_LIST, *PPAGE_LIST;
-
 // create global list heads
-PAGE_LIST AllLists[Active]; // dont need to do Active + 1 because we dont need active list
-#if 1
-#define FreeList AllLists[Free]
-#define ZeroList AllLists[Zero]
-#define ModifiedList AllLists[Modified]
-#define StandbyList AllLists[Standby]
-#define BadList AllLists[Bad]
-#else
-PAGE_LIST FreeList;
-PAGE_LIST ZeroList;
-PAGE_LIST ModifiedList;
-PAGE_LIST StandbyList;
-PAGE_LIST BadList;
-#endif 
+LIST_ENTRY FreeListHead;
+LIST_ENTRY ZeroListHead;
+LIST_ENTRY ModifiedListHead;
+LIST_ENTRY StandbyListHead;
+LIST_ENTRY BadListHead;
+
+// create global coutner variables
+ULONG FreeCount;
+ULONG ZeroCount;
+ULONG ModifiedCount;
+ULONG StandbyCount;
+ULONG BadCount;
 
 // used to calculate leaf page offset
 PVOID BaseLeafPageAddress;
@@ -79,28 +72,26 @@ PPFN_METADATA BasePFNArrayAddress;
 
 VOID
 EnqueueToHead (
-    PPAGE_LIST List,
+    PLIST_ENTRY ListHead,
     PLIST_ENTRY Add
     )
 {
     PLIST_ENTRY PreviousFirst;
 
-    PreviousFirst = List->ListHead.Flink;
+    PreviousFirst = ListHead->Flink;
 
     PreviousFirst->Blink = Add;
     Add->Flink = PreviousFirst;
-    List->ListHead.Flink = Add;
-    Add->Blink = &List->ListHead;
-
-    List->Count += 1;
+    ListHead->Flink = Add;
+    Add->Blink = ListHead;
 }
 
 PLIST_ENTRY
 DequeueFromHead (
-    PPAGE_LIST List
+    PLIST_ENTRY ListHead
     )
 {
-    if (List->ListHead.Flink == &List->ListHead) {
+    if (ListHead->Flink == ListHead) {
         printf("error. list empty\n");
         return  NULL;
     }
@@ -108,13 +99,11 @@ DequeueFromHead (
         PLIST_ENTRY Remove;
         PLIST_ENTRY NewFirst;
 
-        Remove = List->ListHead.Flink;
+        Remove = ListHead->Flink;
         NewFirst = Remove->Flink;
 
-        List->ListHead.Flink = NewFirst;
-        NewFirst->Blink = &List->ListHead;
-
-        List->Count -= 1;
+        ListHead->Flink = NewFirst;
+        NewFirst->Blink = ListHead;
         
         return Remove;
     }
@@ -128,7 +117,6 @@ DequeueFromList (
     PLIST_ENTRY BeforeRemove;
     PLIST_ENTRY AfterRemove;
 
-    // dont need to check if empty bc we know its not, becuase we ask for specific entry in list
     BeforeRemove = Remove->Blink;
     AfterRemove = Remove->Flink;
     BeforeRemove->Flink = AfterRemove;
@@ -138,23 +126,12 @@ DequeueFromList (
 }
 
 VOID
-DequeuePFNFromList (
-    PPFN_METADATA Remove
-    )
-{
-    DequeueFromList(&Remove->Link);
-    AllLists[Remove->PageLocation].Count -= 1;
-
-    return;
-}
-
-VOID
 InitializeListHead (
-    PPAGE_LIST List
+    PLIST_ENTRY ListHead
     )
 {
-    List->ListHead.Flink = &List->ListHead;
-    List->ListHead.Blink = &List->ListHead;
+    ListHead->Flink = ListHead;
+    ListHead->Blink = ListHead;
 }
 
 #if 0
@@ -203,15 +180,16 @@ PageFault (
     }
     if (Pte->Transition == 1) {
         ULONG64 Dequeued;
-        PPFN_METADATA DequeuedAddress;
+        PPFN_METADATA DequeuedAddres;
         printf("a");
         Dequeued = Pte->PFNIndex;
-        DequeuedAddress = BasePFNArrayAddress + Dequeued;
+        DequeuedAddres = BasePFNArrayAddress + Dequeued;
 
-        DequeuePFNFromList(DequeuedAddress);
+        DequeueFromList((PLIST_ENTRY) DequeuedAddres);
 
         Pte->Transition = 0;
         Pte->Valid = 1;
+        StandbyCount -= 1;
 
         printf("pte address: %p, removed offset page: %I64u\n", Pte, Dequeued);
 
@@ -222,7 +200,7 @@ PageFault (
         ULONG_PTR RemovedOffsetPage;
         
         //printf("%p, %p, %p", &FreeListHead, FreeListHead.Flink, FreeListHead.Blink);
-        Removed = (PPFN_METADATA) DequeueFromHead(&FreeList);
+        Removed = (PPFN_METADATA) DequeueFromHead(&FreeListHead);
         if (Removed == NULL) {
             printf("error. no page available\n");
             return;
@@ -237,7 +215,7 @@ PageFault (
         }
         else {
             Removed->PageLocation = Active;
-            FreeList.Count -= 1;
+            FreeCount -= 1;
             Pte->Valid = 1;
             Pte->PFNIndex = RemovedOffsetPage;
             printf("pte address: %p, removed offset page: %d, %x\n", Pte, RemovedOffsetPage, RemovedOffsetPage);
@@ -279,9 +257,10 @@ ActiveToStandby (
 
         Pte->Valid = 0;
         Pte->Transition = 1;
+        StandbyCount += 1;
 
         // need to add pfn here, not pte
-        EnqueueToHead (&StandbyList, (PLIST_ENTRY)Pfn);
+        EnqueueToHead (&StandbyListHead, (PLIST_ENTRY)Pfn);
         printf("successfully removed page from active\n");
 
         return;
@@ -300,11 +279,11 @@ main (
     PVOID LeafAddress;
     
 #if 1
-    InitializeListHead(&FreeList);
-    InitializeListHead(&ZeroList);
-    InitializeListHead(&ModifiedList);
-    InitializeListHead(&StandbyList);
-    InitializeListHead(&BadList);
+    InitializeListHead(&FreeListHead);
+    InitializeListHead(&ZeroListHead);
+    InitializeListHead(&ModifiedListHead);
+    InitializeListHead(&StandbyListHead);
+    InitializeListHead(&BadListHead);
 #else
     FreeListHead.Flink = &FreeListHead;
     FreeListHead.Blink = &FreeListHead;
@@ -349,7 +328,8 @@ main (
         for (ULONG i = 0; i < NUMBER_PAGES; i += 1) {
             PPFN_METADATA NewPFN;
             NewPFN = BasePFNArrayAddress + i; //dont need to do sizeof() because we already specify that its a PFN_METADATA, automatically multiplies i by variable to its left
-            EnqueueToHead (&FreeList, (PLIST_ENTRY) NewPFN);
+            EnqueueToHead (&FreeListHead, (PLIST_ENTRY) NewPFN);
+            FreeCount += 1;
         }
     }
 
@@ -442,7 +422,7 @@ main (
  * increment active
  * set valid bit = 1
  * 
- * active -> modified
+ * active -> modified [x]
  * if detected that freo, zero, and standby are running low (each have 10 pages)
  * set valid bit to 0. need to set this before looking at dirty bit because if valid bit is set at end, the sirty bit couldve been 0, and we think it hasnt been dirtied
  * but then it could be modified a moment later
@@ -451,13 +431,52 @@ main (
  * decrement active
  * enqueue to modified, increment modified
  * 
+ * if (FreeList->Count < 10)  //need to implement the struct properly first
+ * call RemoveFromActive(some PVOIS input)
+ * (we need a page trimming thread that tells u which to remove from active)
+ * 
+ * VOID
+ * RemoveFromActive (
+ *  PVOID Input
+ * )
+ * {
+ * translate leaf page address to a Pte: 
+ * (OffsetBytes = (ULONG_PTR) LeafPageAddress - (ULONG_PTR) BaseLeafPageAddress;
+ * OffsetPage = OffsetBytes / PAGE_SIZE;
+ * Pte = BasePTEArrayAddress + OffsetPage;)
+ * if (Pte->Transition == 1 && Pte->Dirty == 1) {
+ * Pte->Valid = 0;
+ * Pte->Transition = 1;
+ * Decrement (ActiveList)
+ * EnqueueToHead (ModifiedList, PLIST_ENTRY Pte)
+ * }
+ * 
+ * 
  * modified -> active
  * dequeue pfn from modified list, decrement modified
  * set pte transition <- 0
  * set pte valid bit <- 1
  * 
+ * in PageFault: if(Pte->Transition = 1 && Pte->Dirty = 1)
+ * DequeueFromList (Pfn);
+ * Pte->Transition = 0;
+ * Pte->Valid = 1;
+ * 
+ * 
  * modified -> standby
- * SYFIX
+ * if pte transition bit = 1 and pte dirty bit = 1
+ * dequeue pfn from modified list (decrement modified count by 1)
+ * enqueue pfn to standby list (increment standby count by 1)
+ * set dirty bit to 0
+ * 
+ * Q: conditions for this transition to happen
+ * if (meet above conditions) {
+ * if (Pte->Transition = 1 && Pte->Dirty == 1) {
+ * DequeueFromList (Pfn);
+ * EnqueueToHead (StandbyList, PLIST_ENTRY Pte);
+ * Pte->Dirty = 0;
+ * }
+ * }
  * 
  * adding to bad
 **/
